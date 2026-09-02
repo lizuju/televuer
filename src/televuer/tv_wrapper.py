@@ -195,6 +195,7 @@ class TeleData:
     right_hand_squeezeValue: float = 0.0   # (0.0 → 1.0) degree of hand squeeze
 
     motion_data_ready: bool = False        # True after the first hand or controller motion data event is received
+    motion_data_timestamp: float = 0.0     # monotonic timestamp of the latest motion event
     # controller tracking
     # https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html
     # https://immersive-web.github.io/webxr-gamepads-module/
@@ -280,6 +281,25 @@ class TeleVuerWrapper:
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
                               cert_file=cert_file, key_file=key_file)
+        self._last_hand_motion_snapshot = {
+            "left_arm_pose": CONST_LEFT_ARM_POSE.copy(),
+            "right_arm_pose": CONST_RIGHT_ARM_POSE.copy(),
+            "left_hand_positions": np.zeros((25, 3)),
+            "right_hand_positions": np.zeros((25, 3)),
+            "left_hand_orientations": CONST_HAND_ROT.copy(),
+            "right_hand_orientations": CONST_HAND_ROT.copy(),
+            "left_hand_pinch": False,
+            "left_hand_pinchValue": 0.0,
+            "left_hand_squeeze": False,
+            "left_hand_squeezeValue": 0.0,
+            "right_hand_pinch": False,
+            "right_hand_pinchValue": 0.0,
+            "right_hand_squeeze": False,
+            "right_hand_squeezeValue": 0.0,
+            "motion_data_ready": False,
+            "motion_data_timestamp": 0.0,
+            "motion_sample_seq": 0,
+        }
         
     def get_tele_data(self):
         """
@@ -304,9 +324,16 @@ class TeleVuerWrapper:
 
         # hand tracking
         if self.use_hand_tracking:
+            motion_snapshot = self.tvuer.get_hand_motion_snapshot(
+                include_orientations=self.return_hand_rot_data
+            )
+            if motion_snapshot is not None:
+                self._last_hand_motion_snapshot.update(motion_snapshot)
+            motion_snapshot = self._last_hand_motion_snapshot
+
             # 'Arm' pose data follows (basis) OpenXR Convention and (initial pose) OpenXR Arm Convention.
-            left_IPxr_Bxr_world_arm, left_arm_is_valid  = safe_mat_update(CONST_LEFT_ARM_POSE, self.tvuer.left_arm_pose)
-            right_IPxr_Bxr_world_arm, right_arm_is_valid = safe_mat_update(CONST_RIGHT_ARM_POSE, self.tvuer.right_arm_pose)
+            left_IPxr_Bxr_world_arm, left_arm_is_valid  = safe_mat_update(CONST_LEFT_ARM_POSE, motion_snapshot["left_arm_pose"])
+            right_IPxr_Bxr_world_arm, right_arm_is_valid = safe_mat_update(CONST_RIGHT_ARM_POSE, motion_snapshot["right_arm_pose"])
 
             # Change basis convention
             # From (basis) OpenXR Convention to (basis) Robot Convention:
@@ -348,8 +375,10 @@ class TeleVuerWrapper:
                 #    [y0 y1 y1 ··· y23 y24]
                 #    [z0 z1 z2 ··· z23 z24]
                 #    [ 1  1  1 ···  1    1]
-                left_IPxr_Bxr_world_hand_pos  = np.concatenate([self.tvuer.left_hand_positions.T, np.ones((1, self.tvuer.left_hand_positions.shape[0]))])
-                right_IPxr_Bxr_world_hand_pos = np.concatenate([self.tvuer.right_hand_positions.T, np.ones((1, self.tvuer.right_hand_positions.shape[0]))])
+                left_hand_positions = motion_snapshot["left_hand_positions"]
+                right_hand_positions = motion_snapshot["right_hand_positions"]
+                left_IPxr_Bxr_world_hand_pos  = np.concatenate([left_hand_positions.T, np.ones((1, left_hand_positions.shape[0]))])
+                right_IPxr_Bxr_world_hand_pos = np.concatenate([right_hand_positions.T, np.ones((1, right_hand_positions.shape[0]))])
 
                 # Change basis convention
                 # From (basis) OpenXR Convention to (basis) Robot Convention
@@ -380,8 +409,8 @@ class TeleVuerWrapper:
 
             # -----------------------------------hand rotation----------------------------------------
             if self.return_hand_rot_data:
-                left_Bxr_world_hand_rot, left_hand_rot_is_valid  = safe_rot_update(CONST_HAND_ROT, self.tvuer.left_hand_orientations) # [25, 3, 3]
-                right_Bxr_world_hand_rot, right_hand_rot_is_valid = safe_rot_update(CONST_HAND_ROT, self.tvuer.right_hand_orientations)
+                left_Bxr_world_hand_rot, left_hand_rot_is_valid  = safe_rot_update(CONST_HAND_ROT, motion_snapshot["left_hand_orientations"]) # [25, 3, 3]
+                right_Bxr_world_hand_rot, right_hand_rot_is_valid = safe_rot_update(CONST_HAND_ROT, motion_snapshot["right_hand_orientations"])
 
                 if left_hand_rot_is_valid and right_hand_rot_is_valid:
                     left_Bxr_arm_hand_rot = np.einsum('ij,njk->nik', left_IPxr_Bxr_world_arm[:3, :3].T, left_Bxr_world_hand_rot)
@@ -403,15 +432,16 @@ class TeleVuerWrapper:
                 right_hand_pos=right_IPunitree_Brobot_arm_hand_pos,
                 left_hand_rot=left_Brobot_arm_hand_rot,
                 right_hand_rot=right_Brobot_arm_hand_rot,
-                motion_data_ready=self.tvuer.motion_data_ready,
-                left_hand_pinch=self.tvuer.left_hand_pinch,
-                left_hand_pinchValue=self.tvuer.left_hand_pinchValue * 100.0,
-                left_hand_squeeze=self.tvuer.left_hand_squeeze,
-                left_hand_squeezeValue=self.tvuer.left_hand_squeezeValue,
-                right_hand_pinch=self.tvuer.right_hand_pinch,
-                right_hand_pinchValue=self.tvuer.right_hand_pinchValue * 100.0,
-                right_hand_squeeze=self.tvuer.right_hand_squeeze,
-                right_hand_squeezeValue=self.tvuer.right_hand_squeezeValue,
+                motion_data_ready=motion_snapshot["motion_data_ready"],
+                motion_data_timestamp=motion_snapshot["motion_data_timestamp"],
+                left_hand_pinch=motion_snapshot["left_hand_pinch"],
+                left_hand_pinchValue=motion_snapshot["left_hand_pinchValue"] * 100.0,
+                left_hand_squeeze=motion_snapshot["left_hand_squeeze"],
+                left_hand_squeezeValue=motion_snapshot["left_hand_squeezeValue"],
+                right_hand_pinch=motion_snapshot["right_hand_pinch"],
+                right_hand_pinchValue=motion_snapshot["right_hand_pinchValue"] * 100.0,
+                right_hand_squeeze=motion_snapshot["right_hand_squeeze"],
+                right_hand_squeezeValue=motion_snapshot["right_hand_squeezeValue"],
             )
         # controller tracking
         else:
@@ -435,6 +465,7 @@ class TeleVuerWrapper:
                 left_wrist_pose=left_IPunitree_Brobot_waist_arm,
                 right_wrist_pose=right_IPunitree_Brobot_waist_arm,
                 motion_data_ready=self.tvuer.motion_data_ready,
+                motion_data_timestamp=self.tvuer.motion_data_timestamp,
                 left_ctrl_trigger=self.tvuer.left_ctrl_trigger,
                 left_ctrl_triggerValue=10.0 - self.tvuer.left_ctrl_triggerValue * 10,
                 left_ctrl_squeeze=self.tvuer.left_ctrl_squeeze,
