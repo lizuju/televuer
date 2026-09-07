@@ -196,6 +196,8 @@ class TeleData:
 
     motion_data_ready: bool = False        # True after the first hand or controller motion data event is received
     motion_data_timestamp: float = 0.0     # monotonic timestamp: older hand sample or latest controller event
+    left_hand_timestamp: float = 0.0
+    right_hand_timestamp: float = 0.0
     # controller tracking
     # https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html
     # https://immersive-web.github.io/webxr-gamepads-module/
@@ -299,6 +301,8 @@ class TeleVuerWrapper:
             "motion_data_ready": False,
             "motion_data_timestamp": 0.0,
             "motion_sample_seq": 0,
+            "left_hand_timestamp": 0.0,
+            "right_hand_timestamp": 0.0,
         }
         
     def get_tele_data(self):
@@ -434,6 +438,8 @@ class TeleVuerWrapper:
                 right_hand_rot=right_Brobot_arm_hand_rot,
                 motion_data_ready=motion_snapshot["motion_data_ready"],
                 motion_data_timestamp=motion_snapshot["motion_data_timestamp"],
+                left_hand_timestamp=motion_snapshot["left_hand_timestamp"],
+                right_hand_timestamp=motion_snapshot["right_hand_timestamp"],
                 left_hand_pinch=motion_snapshot["left_hand_pinch"],
                 left_hand_pinchValue=motion_snapshot["left_hand_pinchValue"] * 100.0,
                 left_hand_squeeze=motion_snapshot["left_hand_squeeze"],

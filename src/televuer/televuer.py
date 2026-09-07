@@ -141,6 +141,8 @@ class TeleVuer:
         self.right_arm_pose_shared = Array('d', 16, lock=True)
         self.motion_data_ready_shared = Value('b', False, lock=True)
         self.motion_data_timestamp_shared = Value('d', 0.0, lock=True)
+        self.left_hand_timestamp_shared = Value('d', 0.0, lock=True)
+        self.right_hand_timestamp_shared = Value('d', 0.0, lock=True)
         self.motion_sample_seq_shared = Value('L', 0, lock=True)
         if self.use_hand_tracking:
             self.left_hand_position_shared = Array('d', 75, lock=True)
@@ -303,8 +305,13 @@ class TeleVuer:
 
             def is_valid_hand_pose(data):
                 try:
-                    return len(data) >= 25 * 16
-                except TypeError:
+                    pose = np.asarray(data, dtype=float)
+                    return (
+                        pose.shape == (25 * 16,)
+                        and np.isfinite(pose).all()
+                        and not np.isclose(np.linalg.det(pose[:16].reshape(4, 4)), 0.0)
+                    )
+                except (TypeError, ValueError):
                     return False
 
             left_valid = is_valid_hand_pose(left_hand_data)
@@ -348,10 +355,14 @@ class TeleVuer:
                 extract_hand_poses(left_hand_data, self.left_arm_pose_shared, self.left_hand_position_shared, self.left_hand_orientation_shared)
                 extract_hands(left_hand, "left")
                 self._last_left_hand_timestamp = now
+                with self.left_hand_timestamp_shared.get_lock():
+                    self.left_hand_timestamp_shared.value = now
             if right_valid:
                 extract_hand_poses(right_hand_data, self.right_arm_pose_shared, self.right_hand_position_shared, self.right_hand_orientation_shared)
                 extract_hands(right_hand, "right")
                 self._last_right_hand_timestamp = now
+                with self.right_hand_timestamp_shared.get_lock():
+                    self.right_hand_timestamp_shared.value = now
 
             pair_timestamp = min(self._last_left_hand_timestamp, self._last_right_hand_timestamp)
             with self.motion_data_ready_shared.get_lock():
@@ -978,6 +989,10 @@ class TeleVuer:
                 "motion_data_timestamp": self.motion_data_timestamp,
                 "motion_sample_seq": seq_before,
             }
+            with self.left_hand_timestamp_shared.get_lock():
+                snapshot["left_hand_timestamp"] = self.left_hand_timestamp_shared.value
+            with self.right_hand_timestamp_shared.get_lock():
+                snapshot["right_hand_timestamp"] = self.right_hand_timestamp_shared.value
             if include_orientations:
                 snapshot["left_hand_orientations"] = self.left_hand_orientations
                 snapshot["right_hand_orientations"] = self.right_hand_orientations
