@@ -359,7 +359,8 @@ class TeleVuer:
             pair_max_age = 0.5 if motion_data_ready else 0.1
             if pair_timestamp > 0.0 and now - pair_timestamp <= pair_max_age:
                 with self.motion_data_timestamp_shared.get_lock():
-                    self.motion_data_timestamp_shared.value = now
+                    # A fresh hand must not hide stale data from the other hand.
+                    self.motion_data_timestamp_shared.value = pair_timestamp
                 if not motion_data_ready:
                     with self.motion_data_ready_shared.get_lock():
                         self.motion_data_ready_shared.value = True
@@ -949,7 +950,7 @@ class TeleVuer:
 
     @property
     def motion_data_timestamp(self):
-        """Monotonic timestamp of the latest hand or controller motion event."""
+        """Monotonic timestamp of the older hand sample or latest controller event."""
         with self.motion_data_timestamp_shared.get_lock():
             return self.motion_data_timestamp_shared.value
 

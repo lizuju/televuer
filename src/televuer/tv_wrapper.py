@@ -195,7 +195,7 @@ class TeleData:
     right_hand_squeezeValue: float = 0.0   # (0.0 → 1.0) degree of hand squeeze
 
     motion_data_ready: bool = False        # True after the first hand or controller motion data event is received
-    motion_data_timestamp: float = 0.0     # monotonic timestamp of the latest motion event
+    motion_data_timestamp: float = 0.0     # monotonic timestamp: older hand sample or latest controller event
     # controller tracking
     # https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html
     # https://immersive-web.github.io/webxr-gamepads-module/
