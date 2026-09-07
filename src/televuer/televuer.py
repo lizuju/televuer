@@ -157,6 +157,8 @@ class TeleVuer:
             self.right_hand_pinchValue_shared = Value('d', 0.0, lock=True)
             self.right_hand_squeeze_shared = Value('b', False, lock=True)
             self.right_hand_squeezeValue_shared = Value('d', 0.0, lock=True)
+            self._last_left_hand_timestamp = 0.0
+            self._last_right_hand_timestamp = 0.0
         else:
             self.left_ctrl_trigger_shared = Value('b', False, lock=True)
             self.left_ctrl_triggerValue_shared = Value('d', 0.0, lock=True)
@@ -289,10 +291,27 @@ class TeleVuer:
         sample_seq = self._begin_motion_sample()
         try:
             # HandsData
-            left_hand_data = event.value["left"]
-            right_hand_data = event.value["right"]
-            left_hand = event.value["leftState"]
-            right_hand = event.value["rightState"]
+            hand_data = event.value
+            if not isinstance(hand_data, dict):
+                raise ValueError("hand tracking payload must be an object")
+            left_hand_data = hand_data.get("left")
+            right_hand_data = hand_data.get("right")
+            left_hand = hand_data.get("leftState")
+            right_hand = hand_data.get("rightState")
+            left_hand = left_hand if isinstance(left_hand, dict) else {}
+            right_hand = right_hand if isinstance(right_hand, dict) else {}
+
+            def is_valid_hand_pose(data):
+                try:
+                    return len(data) >= 25 * 16
+                except TypeError:
+                    return False
+
+            left_valid = is_valid_hand_pose(left_hand_data)
+            right_valid = is_valid_hand_pose(right_hand_data)
+            if not left_valid and not right_valid:
+                raise ValueError("neither hand is currently tracked")
+
             # HandState
             def extract_hand_poses(hand_data, arm_pose_shared, hand_position_shared, hand_orientation_shared):
                 with arm_pose_shared.get_lock():
@@ -324,18 +343,50 @@ class TeleVuer:
                 with getattr(self, f"{prefix}_hand_squeezeValue_shared").get_lock():
                     getattr(self, f"{prefix}_hand_squeezeValue_shared").value = float(handState.get("squeezeValue", 0.0))
 
-            extract_hand_poses(left_hand_data, self.left_arm_pose_shared, self.left_hand_position_shared, self.left_hand_orientation_shared)
-            extract_hand_poses(right_hand_data, self.right_arm_pose_shared, self.right_hand_position_shared, self.right_hand_orientation_shared)
-            extract_hands(left_hand, "left")
-            extract_hands(right_hand, "right")
-            with self.motion_data_timestamp_shared.get_lock():
-                self.motion_data_timestamp_shared.value = time.monotonic()
+            now = time.monotonic()
+            if left_valid:
+                extract_hand_poses(left_hand_data, self.left_arm_pose_shared, self.left_hand_position_shared, self.left_hand_orientation_shared)
+                extract_hands(left_hand, "left")
+                self._last_left_hand_timestamp = now
+            if right_valid:
+                extract_hand_poses(right_hand_data, self.right_arm_pose_shared, self.right_hand_position_shared, self.right_hand_orientation_shared)
+                extract_hands(right_hand, "right")
+                self._last_right_hand_timestamp = now
+
+            pair_timestamp = min(self._last_left_hand_timestamp, self._last_right_hand_timestamp)
             with self.motion_data_ready_shared.get_lock():
-                self.motion_data_ready_shared.value = True
+                motion_data_ready = bool(self.motion_data_ready_shared.value)
+            pair_max_age = 0.5 if motion_data_ready else 0.1
+            if pair_timestamp > 0.0 and now - pair_timestamp <= pair_max_age:
+                with self.motion_data_timestamp_shared.get_lock():
+                    self.motion_data_timestamp_shared.value = now
+                if not motion_data_ready:
+                    with self.motion_data_ready_shared.get_lock():
+                        self.motion_data_ready_shared.value = True
             self._commit_motion_sample(sample_seq)
 
-        except:
-            pass
+        except Exception as exc:
+            now = time.monotonic()
+            if now - getattr(self, "_last_hand_move_error_log", 0.0) >= 1.0:
+                value = event.value
+                keys = sorted(value.keys()) if isinstance(value, dict) else None
+                left = value.get("left") if isinstance(value, dict) else None
+                right = value.get("right") if isinstance(value, dict) else None
+                try:
+                    left_len = len(left) if left is not None else None
+                except TypeError:
+                    left_len = None
+                try:
+                    right_len = len(right) if right is not None else None
+                except TypeError:
+                    right_len = None
+                print(
+                    f"[TeleVuer] HAND_MOVE rejected: {type(exc).__name__}: {exc}; "
+                    f"keys={keys}; left_type={type(left).__name__}; left_len={left_len}; "
+                    f"right_type={type(right).__name__}; right_len={right_len}",
+                    flush=True,
+                )
+                self._last_hand_move_error_log = now
     
     ## immersive MODE
     async def main_image_binocular_zmq(self, session):
