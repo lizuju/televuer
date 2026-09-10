@@ -1,4 +1,5 @@
 import numpy as np
+import threading
 from .televuer import TeleVuer
 from dataclasses import dataclass, field
 from typing import Literal
@@ -283,6 +284,7 @@ class TeleVuerWrapper:
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
                               cert_file=cert_file, key_file=key_file)
+        self._tele_data_lock = threading.Lock()
         self._last_hand_motion_snapshot = {
             "left_arm_pose": CONST_LEFT_ARM_POSE.copy(),
             "right_arm_pose": CONST_RIGHT_ARM_POSE.copy(),
@@ -306,6 +308,11 @@ class TeleVuerWrapper:
         }
         
     def get_tele_data(self):
+        # Arm and hand loops share this wrapper, but not its mutable snapshot cache.
+        with self._tele_data_lock:
+            return self._get_tele_data()
+
+    def _get_tele_data(self):
         """
         Get processed motion state data from the TeleVuer instance.
 

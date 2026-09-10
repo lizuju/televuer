@@ -1,6 +1,7 @@
 from vuer import Vuer
 from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
 from multiprocessing import Value, Array, Process, shared_memory
+from msgpack import ExtType
 import numpy as np
 import asyncio
 import threading
@@ -9,6 +10,52 @@ import os
 import time
 from pathlib import Path
 from typing import Literal
+
+
+HAND_TRACKING_STATES = ("missing", "tracking", "invalid")
+
+
+class HandPoseGuard:
+    def __init__(self):
+        self.pose = None
+        self.timestamp = 0.0
+        self.tracking = False
+        self.status = "missing"
+
+    def lose(self, status):
+        self.tracking = False
+        self.status = status
+
+    def update(self, data, now):
+        if isinstance(data, ExtType):
+            # msgpackr represents JavaScript undefined as fixext1 type 0, byte 0.
+            if data.code == 0 and data.data == b"\x00":
+                data = None
+            else:
+                raise ValueError(f"unsupported hand extension code={data.code}, bytes={len(data.data)}")
+        if data is None or isinstance(data, (list, tuple)) and len(data) == 0:
+            self.lose("missing")
+            return None
+        flat = np.asarray(data, dtype=float)
+        if flat.shape != (400,) or not np.isfinite(flat).all():
+            raise ValueError("hand poses must contain 400 finite numbers")
+        matrices = flat.reshape(25, 4, 4).transpose(0, 2, 1)
+        rotations = matrices[:, :3, :3]
+        if (not np.allclose(matrices[:, 3, :], [0, 0, 0, 1], atol=1e-4)
+                or not np.allclose(rotations.transpose(0, 2, 1) @ rotations, np.eye(3), atol=1e-3)
+                or not np.allclose(np.linalg.det(rotations), 1.0, atol=1e-3)):
+            raise ValueError("hand joint transforms must be rigid poses")
+        if np.max(np.linalg.norm(matrices[:, :3, 3] - matrices[0, :3, 3], axis=1)) > 0.35:
+            raise ValueError("hand joints exceed wrist-relative hand size")
+        self.accept_wrist(matrices[0], now)
+        return flat
+
+    def accept_wrist(self, wrist, now):
+        # Input validity is checked above; motion amplitude is not tracking validity.
+        self.pose, self.timestamp = wrist.copy(), now
+        self.tracking = True
+        self.status = "tracking"
+        return True
 
 
 class TeleVuer:
@@ -144,6 +191,9 @@ class TeleVuer:
         self.left_hand_timestamp_shared = Value('d', 0.0, lock=True)
         self.right_hand_timestamp_shared = Value('d', 0.0, lock=True)
         self.motion_sample_seq_shared = Value('L', 0, lock=True)
+        # Events, accepted hands, errors, missing hands, and suspect hands.
+        self.tracking_event_counts_shared = Array('L', 9, lock=True)
+        self.tracking_hand_status_shared = Array('i', 2, lock=True)
         if self.use_hand_tracking:
             self.left_hand_position_shared = Array('d', 75, lock=True)
             self.right_hand_position_shared = Array('d', 75, lock=True)
@@ -159,8 +209,7 @@ class TeleVuer:
             self.right_hand_pinchValue_shared = Value('d', 0.0, lock=True)
             self.right_hand_squeeze_shared = Value('b', False, lock=True)
             self.right_hand_squeezeValue_shared = Value('d', 0.0, lock=True)
-            self._last_left_hand_timestamp = 0.0
-            self._last_right_hand_timestamp = 0.0
+            self.hand_pose_guards = (HandPoseGuard(), HandPoseGuard())
         else:
             self.left_ctrl_trigger_shared = Value('b', False, lock=True)
             self.left_ctrl_triggerValue_shared = Value('d', 0.0, lock=True)
@@ -227,6 +276,8 @@ class TeleVuer:
                 pass
 
     async def on_cam_move(self, event, session, fps=60):
+        with self.tracking_event_counts_shared.get_lock():
+            self.tracking_event_counts_shared[0] += 1
         try:
             with self.head_pose_shared.get_lock():
                 self.head_pose_shared[:] = event.value["camera"]["matrix"]
@@ -289,117 +340,73 @@ class TeleVuer:
                 self.motion_sample_seq_shared.value = sample_seq + 1
 
     async def on_hand_move(self, event, session, fps=60):
-        """https://docs.vuer.ai/en/latest/examples/19_hand_tracking.html"""
+        with self.tracking_event_counts_shared.get_lock():
+            self.tracking_event_counts_shared[1] += 1
         sample_seq = self._begin_motion_sample()
+        now = time.monotonic()
+        errors = []
+        timestamps = []
         try:
-            # HandsData
-            hand_data = event.value
-            if not isinstance(hand_data, dict):
-                raise ValueError("hand tracking payload must be an object")
-            left_hand_data = hand_data.get("left")
-            right_hand_data = hand_data.get("right")
-            left_hand = hand_data.get("leftState")
-            right_hand = hand_data.get("rightState")
-            left_hand = left_hand if isinstance(left_hand, dict) else {}
-            right_hand = right_hand if isinstance(right_hand, dict) else {}
-
-            def is_valid_hand_pose(data):
+            for index, (side, guard) in enumerate(zip(("left", "right"), self.hand_pose_guards)):
+                flat = None
                 try:
-                    pose = np.asarray(data, dtype=float)
-                    return (
-                        pose.shape == (25 * 16,)
-                        and np.isfinite(pose).all()
-                        and not np.isclose(np.linalg.det(pose[:16].reshape(4, 4)), 0.0)
-                    )
-                except (TypeError, ValueError):
-                    return False
+                    if not isinstance(event.value, dict):
+                        raise ValueError("hand tracking payload must be an object")
+                    flat = guard.update(event.value.get(side), now)
+                    if flat is not None:
+                        state = event.value.get(side + "State")
+                        state = state if isinstance(state, dict) else {}
+                        pinch_value = float(state.get("pinchValue", 0.0))
+                        squeeze_value = float(state.get("squeezeValue", 0.0))
+                        if not np.isfinite([pinch_value, squeeze_value]).all():
+                            raise ValueError("hand gestures must be finite")
+                except (TypeError, ValueError, OverflowError) as exc:
+                    flat = None
+                    guard.lose("invalid")
+                    errors.append(f"{side}: {exc}")
 
-            left_valid = is_valid_hand_pose(left_hand_data)
-            right_valid = is_valid_hand_pose(right_hand_data)
-            if not left_valid and not right_valid:
-                raise ValueError("neither hand is currently tracked")
+                # Invalidate this side in the same snapshot as the event that lost tracking.
+                timestamp = now if flat is not None else 0.0
+                with getattr(self, side + "_hand_timestamp_shared").get_lock():
+                    getattr(self, side + "_hand_timestamp_shared").value = timestamp
+                timestamps.append(timestamp)
+                with self.tracking_hand_status_shared.get_lock():
+                    self.tracking_hand_status_shared[index] = HAND_TRACKING_STATES.index(guard.status)
+                with self.tracking_event_counts_shared.get_lock():
+                    self.tracking_event_counts_shared[2 + index] += int(flat is not None)
+                    self.tracking_event_counts_shared[5 + index] += int(guard.status == "missing")
+                    self.tracking_event_counts_shared[7 + index] += int(guard.status == "invalid")
+                if flat is None:
+                    continue
+                matrices = flat.reshape(25, 4, 4)
+                with getattr(self, side + "_arm_pose_shared").get_lock():
+                    getattr(self, side + "_arm_pose_shared")[:] = flat[:16]
+                with getattr(self, side + "_hand_position_shared").get_lock():
+                    getattr(self, side + "_hand_position_shared")[:] = matrices[:, 3, :3].flatten()
+                with getattr(self, side + "_hand_orientation_shared").get_lock():
+                    getattr(self, side + "_hand_orientation_shared")[:] = matrices[:, :3, :3].flatten()
+                for field, value in (
+                    ("pinch", bool(state.get("pinch", False))), ("pinchValue", pinch_value),
+                    ("squeeze", bool(state.get("squeeze", False))), ("squeezeValue", squeeze_value),
+                ):
+                    shared = getattr(self, side + "_hand_" + field + "_shared")
+                    with shared.get_lock():
+                        shared.value = value
 
-            # HandState
-            def extract_hand_poses(hand_data, arm_pose_shared, hand_position_shared, hand_orientation_shared):
-                with arm_pose_shared.get_lock():
-                    arm_pose_shared[:] = hand_data[0:16]
-
-                with hand_position_shared.get_lock():
-                    for i in range(25):
-                        base = i * 16
-                        hand_position_shared[i * 3: i * 3 + 3] = [hand_data[base + 12], hand_data[base + 13], hand_data[base + 14]]
-
-                with hand_orientation_shared.get_lock():
-                    for i in range(25):
-                        base = i * 16
-                        hand_orientation_shared[i * 9: i * 9 + 9] = [
-                            hand_data[base + 0], hand_data[base + 1], hand_data[base + 2],
-                            hand_data[base + 4], hand_data[base + 5], hand_data[base + 6],
-                            hand_data[base + 8], hand_data[base + 9], hand_data[base + 10],
-                        ]
-
-            def extract_hands(handState, prefix):
-                # pinch
-                with getattr(self, f"{prefix}_hand_pinch_shared").get_lock():
-                    getattr(self, f"{prefix}_hand_pinch_shared").value = bool(handState.get("pinch", False))
-                with getattr(self, f"{prefix}_hand_pinchValue_shared").get_lock():
-                    getattr(self, f"{prefix}_hand_pinchValue_shared").value = float(handState.get("pinchValue", 0.0))
-                # squeeze
-                with getattr(self, f"{prefix}_hand_squeeze_shared").get_lock():
-                    getattr(self, f"{prefix}_hand_squeeze_shared").value = bool(handState.get("squeeze", False))
-                with getattr(self, f"{prefix}_hand_squeezeValue_shared").get_lock():
-                    getattr(self, f"{prefix}_hand_squeezeValue_shared").value = float(handState.get("squeezeValue", 0.0))
-
-            now = time.monotonic()
-            if left_valid:
-                extract_hand_poses(left_hand_data, self.left_arm_pose_shared, self.left_hand_position_shared, self.left_hand_orientation_shared)
-                extract_hands(left_hand, "left")
-                self._last_left_hand_timestamp = now
-                with self.left_hand_timestamp_shared.get_lock():
-                    self.left_hand_timestamp_shared.value = now
-            if right_valid:
-                extract_hand_poses(right_hand_data, self.right_arm_pose_shared, self.right_hand_position_shared, self.right_hand_orientation_shared)
-                extract_hands(right_hand, "right")
-                self._last_right_hand_timestamp = now
-                with self.right_hand_timestamp_shared.get_lock():
-                    self.right_hand_timestamp_shared.value = now
-
-            pair_timestamp = min(self._last_left_hand_timestamp, self._last_right_hand_timestamp)
-            with self.motion_data_ready_shared.get_lock():
-                motion_data_ready = bool(self.motion_data_ready_shared.value)
-            pair_max_age = 0.5 if motion_data_ready else 0.1
-            if pair_timestamp > 0.0 and now - pair_timestamp <= pair_max_age:
-                with self.motion_data_timestamp_shared.get_lock():
-                    # A fresh hand must not hide stale data from the other hand.
-                    self.motion_data_timestamp_shared.value = pair_timestamp
-                if not motion_data_ready:
-                    with self.motion_data_ready_shared.get_lock():
-                        self.motion_data_ready_shared.value = True
+            with self.motion_data_timestamp_shared.get_lock():
+                self.motion_data_timestamp_shared.value = min(timestamps)
+            if all(timestamps):
+                with self.motion_data_ready_shared.get_lock():
+                    self.motion_data_ready_shared.value = True
+        finally:
             self._commit_motion_sample(sample_seq)
-
-        except Exception as exc:
-            now = time.monotonic()
+        if errors:
+            with self.tracking_event_counts_shared.get_lock():
+                self.tracking_event_counts_shared[4] += 1
             if now - getattr(self, "_last_hand_move_error_log", 0.0) >= 1.0:
-                value = event.value
-                keys = sorted(value.keys()) if isinstance(value, dict) else None
-                left = value.get("left") if isinstance(value, dict) else None
-                right = value.get("right") if isinstance(value, dict) else None
-                try:
-                    left_len = len(left) if left is not None else None
-                except TypeError:
-                    left_len = None
-                try:
-                    right_len = len(right) if right is not None else None
-                except TypeError:
-                    right_len = None
-                print(
-                    f"[TeleVuer] HAND_MOVE rejected: {type(exc).__name__}: {exc}; "
-                    f"keys={keys}; left_type={type(left).__name__}; left_len={left_len}; "
-                    f"right_type={type(right).__name__}; right_len={right_len}",
-                    flush=True,
-                )
+                print("[TeleVuer] HAND_MOVE malformed: " + "; ".join(errors), flush=True)
                 self._last_hand_move_error_log = now
-    
+
     ## immersive MODE
     async def main_image_binocular_zmq(self, session):
         if self.use_hand_tracking:
@@ -526,7 +533,7 @@ class TeleVuer:
                     iceServers=[], 
                     key="video-quad",
                     aspect=self.aspect_ratio,
-                    height = 7,
+                    height = 11,
                     layout="stereo-left-right"
                 ),
                 to="bgChildren",
@@ -964,6 +971,32 @@ class TeleVuer:
         """Monotonic timestamp of the older hand sample or latest controller event."""
         with self.motion_data_timestamp_shared.get_lock():
             return self.motion_data_timestamp_shared.value
+
+    def get_tracking_diagnostics(self):
+        with self.tracking_event_counts_shared.get_lock():
+            result = dict(zip(
+                ("camera_events", "hand_events", "left_valid", "right_valid", "rejected",
+                 "left_missing", "right_missing", "left_suspect", "right_suspect"),
+                self.tracking_event_counts_shared[:],
+            ))
+        now = time.monotonic()
+        for name, shared in (
+            ("left_age_ms", self.left_hand_timestamp_shared),
+            ("right_age_ms", self.right_hand_timestamp_shared),
+            ("pair_age_ms", self.motion_data_timestamp_shared),
+        ):
+            with shared.get_lock():
+                timestamp = shared.value
+            result[name] = round((now - timestamp) * 1000.0, 1) if timestamp > 0 else None
+        result["ready"] = self.motion_data_ready
+        with self.tracking_hand_status_shared.get_lock():
+            for index, side in enumerate(("left", "right")):
+                result[side + "_state"] = HAND_TRACKING_STATES[self.tracking_hand_status_shared[index]]
+                age = result[side + "_age_ms"]
+                result[side + "_fresh"] = age is not None and 0.0 <= age <= 250.0
+        with self.motion_sample_seq_shared.get_lock():
+            result["sample_seq"] = self.motion_sample_seq_shared.value
+        return result
 
     def get_hand_motion_snapshot(self, include_orientations=False, max_attempts=3):
         for _ in range(max_attempts):
