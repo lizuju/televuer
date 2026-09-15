@@ -1,4 +1,5 @@
 import numpy as np
+import threading
 from .televuer import TeleVuer
 from dataclasses import dataclass, field
 from typing import Literal
@@ -195,7 +196,9 @@ class TeleData:
     right_hand_squeezeValue: float = 0.0   # (0.0 → 1.0) degree of hand squeeze
 
     motion_data_ready: bool = False        # True after the first hand or controller motion data event is received
-    motion_data_timestamp: float = 0.0     # monotonic timestamp of the latest motion event
+    motion_data_timestamp: float = 0.0     # monotonic timestamp: older hand sample or latest controller event
+    left_hand_timestamp: float = 0.0
+    right_hand_timestamp: float = 0.0
     # controller tracking
     # https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html
     # https://immersive-web.github.io/webxr-gamepads-module/
@@ -230,6 +233,9 @@ class TeleVuerWrapper:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=(480, 1280), display_fps: float=30.0,
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
                        cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False,
+                       wrist_panels: tuple=(), wrist_panel_height: float=0.26, wrist_panel_distance: float=1.2,
+                       wrist_panel_offset: tuple=(0.40, 0.40), wrist_panel_aspect: float=4.0 / 3.0,
+                       wrist_panel_shape: tuple=(240, 320),
                        arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw"):
         """
         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
@@ -280,7 +286,11 @@ class TeleVuerWrapper:
         self.arm_reference_mode = arm_reference_mode
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
-                              cert_file=cert_file, key_file=key_file)
+                              cert_file=cert_file, key_file=key_file,
+                              wrist_panels=wrist_panels, wrist_panel_height=wrist_panel_height,
+                              wrist_panel_distance=wrist_panel_distance, wrist_panel_offset=wrist_panel_offset,
+                              wrist_panel_aspect=wrist_panel_aspect, wrist_panel_shape=wrist_panel_shape)
+        self._tele_data_lock = threading.Lock()
         self._last_hand_motion_snapshot = {
             "left_arm_pose": CONST_LEFT_ARM_POSE.copy(),
             "right_arm_pose": CONST_RIGHT_ARM_POSE.copy(),
@@ -299,9 +309,20 @@ class TeleVuerWrapper:
             "motion_data_ready": False,
             "motion_data_timestamp": 0.0,
             "motion_sample_seq": 0,
+            "left_hand_timestamp": 0.0,
+            "right_hand_timestamp": 0.0,
         }
         
+    def render_wrist_to_xr(self, side, image):
+        """Publish one wrist camera frame (BGR) to its HUD panel."""
+        self.tvuer.render_wrist_to_xr(side, image)
+
     def get_tele_data(self):
+        # Arm and hand loops share this wrapper, but not its mutable snapshot cache.
+        with self._tele_data_lock:
+            return self._get_tele_data()
+
+    def _get_tele_data(self):
         """
         Get processed motion state data from the TeleVuer instance.
 
@@ -434,6 +455,8 @@ class TeleVuerWrapper:
                 right_hand_rot=right_Brobot_arm_hand_rot,
                 motion_data_ready=motion_snapshot["motion_data_ready"],
                 motion_data_timestamp=motion_snapshot["motion_data_timestamp"],
+                left_hand_timestamp=motion_snapshot["left_hand_timestamp"],
+                right_hand_timestamp=motion_snapshot["right_hand_timestamp"],
                 left_hand_pinch=motion_snapshot["left_hand_pinch"],
                 left_hand_pinchValue=motion_snapshot["left_hand_pinchValue"] * 100.0,
                 left_hand_squeeze=motion_snapshot["left_hand_squeeze"],
