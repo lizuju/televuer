@@ -233,9 +233,6 @@ class TeleVuerWrapper:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=(480, 1280), display_fps: float=30.0,
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
                        cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False,
-                       wrist_panels: tuple=(), wrist_panel_height: float=0.26, wrist_panel_distance: float=1.2,
-                       wrist_panel_offset: tuple=(0.40, 0.40), wrist_panel_aspect: float=4.0 / 3.0,
-                       wrist_panel_shape: tuple=(240, 320),
                        arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw"):
         """
         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
@@ -286,10 +283,7 @@ class TeleVuerWrapper:
         self.arm_reference_mode = arm_reference_mode
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
-                              cert_file=cert_file, key_file=key_file,
-                              wrist_panels=wrist_panels, wrist_panel_height=wrist_panel_height,
-                              wrist_panel_distance=wrist_panel_distance, wrist_panel_offset=wrist_panel_offset,
-                              wrist_panel_aspect=wrist_panel_aspect, wrist_panel_shape=wrist_panel_shape)
+                              cert_file=cert_file, key_file=key_file)
         self._tele_data_lock = threading.Lock()
         self._last_hand_motion_snapshot = {
             "left_arm_pose": CONST_LEFT_ARM_POSE.copy(),
@@ -313,10 +307,6 @@ class TeleVuerWrapper:
             "right_hand_timestamp": 0.0,
         }
         
-    def render_wrist_to_xr(self, side, image):
-        """Publish one wrist camera frame (BGR) to its HUD panel."""
-        self.tvuer.render_wrist_to_xr(side, image)
-
     def get_tele_data(self):
         # Arm and hand loops share this wrapper, but not its mutable snapshot cache.
         with self._tele_data_lock:

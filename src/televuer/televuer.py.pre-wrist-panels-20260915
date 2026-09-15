@@ -61,10 +61,7 @@ class HandPoseGuard:
 class TeleVuer:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=None, display_fps: float=30.0,
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
-                       cert_file: str=None, key_file: str=None,
-                       wrist_panels: tuple=(), wrist_panel_height: float=0.26, wrist_panel_distance: float=1.2,
-                       wrist_panel_offset: tuple=(0.40, 0.40), wrist_panel_aspect: float=4.0 / 3.0,
-                       wrist_panel_shape: tuple=(240, 320)):
+                       cert_file: str=None, key_file: str=None):
         """
         TeleVuer class for OpenXR-based XR teleoperate applications.
         This class handles the communication with the Vuer server and manages image and pose data.
@@ -78,17 +75,6 @@ class TeleVuer:
         :param zmq: bool, whether to use zmq for image transmission.
         :param webrtc: bool, whether to use webrtc for real-time communication.
         :param webrtc_url: str, URL for the webrtc offer. must be provided if webrtc is True.
-        :param wrist_panels: sequence of sides ("left"/"right") that get an independent HUD panel.
-            The frames are pushed from the main loop with render_wrist_to_xr(), which is the only
-            element type this headset client renders next to the head background: a second WebRTC
-            element never negotiates (measured on 2026-09-15), so the panels ride the scene channel.
-        :param wrist_panel_height: float, panel height in meters at `wrist_panel_distance`.
-        :param wrist_panel_distance: float, meters in front of the eyes where the panels sit.
-        :param wrist_panel_offset: tuple, (x, y) panel centre offset in meters; x is mirrored per side
-            (left panel at -x, right panel at +x) and y is applied downwards.
-        :param wrist_panel_aspect: float, panel width/height (4:3 for the 640x480 wrist cameras).
-        :param wrist_panel_shape: tuple, (height, width) the wrist frames are scaled to before they
-            are JPEG-encoded into the scene stream; small keeps the tracking channel light.
         :param cert_file: str, path to the SSL certificate file.
         :param key_file: str, path to the SSL key file.
 
@@ -161,25 +147,6 @@ class TeleVuer:
         self.zmq = zmq
         self.webrtc = webrtc
         self.webrtc_url = webrtc_url
-
-        # Wrist camera HUD panels: one independent panel per side, fed with BGR
-        # frames by the main loop. The frames cross into the vuer process through
-        # shared memory (same trick as the zmq background) because they are
-        # published as ImageBackground elements next to the head view.
-        self.wrist_panel_sides = tuple(side for side in wrist_panels if side in ("left", "right"))
-        self.wrist_panel_height = float(wrist_panel_height)
-        self.wrist_panel_distance = float(wrist_panel_distance)
-        self.wrist_panel_offset = (float(wrist_panel_offset[0]), float(wrist_panel_offset[1]))
-        self.wrist_panel_aspect = float(wrist_panel_aspect)
-        self.wrist_panel_shape = (int(wrist_panel_shape[0]), int(wrist_panel_shape[1]), 3)
-        self.wrist_panel_shm = {}
-        self.wrist_panel_frames = {}
-        self.wrist_panel_seq = {}
-        for side in self.wrist_panel_sides:
-            panel_shm = shared_memory.SharedMemory(create=True, size=int(np.prod(self.wrist_panel_shape)))
-            self.wrist_panel_shm[side] = panel_shm
-            self.wrist_panel_frames[side] = np.ndarray(self.wrist_panel_shape, dtype=np.uint8, buffer=panel_shm.buf)
-            self.wrist_panel_seq[side] = Value('L', 0, lock=True)
 
         if self.display_mode == "immersive":
             if self.webrtc:
@@ -307,15 +274,6 @@ class TeleVuer:
                 self.img2display_shm.unlink()
             except:
                 pass
-        for panel_shm in self.wrist_panel_shm.values():
-            try:
-                panel_shm.close()
-                panel_shm.unlink()
-            except:
-                pass
-        self.wrist_panel_shm = {}
-        self.wrist_panel_frames = {}
-        self.wrist_panel_seq = {}
 
     async def on_cam_move(self, event, session, fps=60):
         with self.tracking_event_counts_shared.get_lock():
@@ -454,67 +412,6 @@ class TeleVuer:
                 print("[TeleVuer] HAND_MOVE malformed: " + "; ".join(errors), flush=True)
                 self._last_hand_move_error_log = now
 
-    # ==================== wrist camera panels ====================
-    def render_wrist_to_xr(self, side, image):
-        """Publish one wrist camera frame (BGR) to the matching HUD panel.
-
-        Called from the main teleop loop; the frame is scaled down once here and
-        then re-encoded into the scene stream by the vuer process. Safe to call
-        before the headset connects (the panel simply shows the latest frame).
-        """
-        frame = self.wrist_panel_frames.get(side)
-        if frame is None or image is None:
-            return
-        image = np.asarray(image)
-        if image.ndim != 3 or image.shape[2] != 3:
-            return
-        if image.shape[:2] != frame.shape[:2]:
-            image = cv2.resize(image, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
-        frame[:] = image
-        sequence = self.wrist_panel_seq[side]
-        with sequence.get_lock():
-            sequence.value += 1
-
-    def wrist_panel_ready(self, side):
-        sequence = self.wrist_panel_seq.get(side)
-        if sequence is None:
-            return False
-        with sequence.get_lock():
-            return sequence.value > 0
-
-    def _wrist_panel_elements(self):
-        """HUD panels for the wrist cameras that have received a frame.
-
-        `ImageBackground` is the overlay element the headset renders next to the
-        head view; `position`/`distanceToCamera`/`height` place it at the lower
-        left/right of the field of view and mirror the offset per side.
-        """
-        elements = []
-        for side, sign in (("left", -1.0), ("right", 1.0)):
-            frame = self.wrist_panel_frames.get(side)
-            if frame is None or not self.wrist_panel_ready(side):
-                continue
-            elements.append(
-                ImageBackground(
-                    frame,
-                    aspect=self.wrist_panel_aspect,
-                    height=self.wrist_panel_height,
-                    distanceToCamera=self.wrist_panel_distance,
-                    position=[sign * self.wrist_panel_offset[0], -self.wrist_panel_offset[1], 0.0],
-                    format="jpeg",
-                    quality=75,
-                    key=f"wrist-{side}",
-                )
-            )
-        return elements
-
-    def _upsert_wrist_panels(self, session):
-        """(Re)publish the wrist panels; called every frame by the render loops
-        because a one-shot upsert races the headset's page load."""
-        elements = self._wrist_panel_elements()
-        if elements:
-            session.upsert(elements, to="bgChildren")
-
     ## immersive MODE
     async def main_image_binocular_zmq(self, session):
         if self.use_hand_tracking:
@@ -569,7 +466,6 @@ class TeleVuer:
                 to="bgChildren",
             )
             # 'jpeg' encoding should give you about 30fps with a 16ms wait in-between.
-            self._upsert_wrist_panels(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_zmq(self, session):
@@ -610,7 +506,6 @@ class TeleVuer:
                 ],
                 to="bgChildren",
             )
-            self._upsert_wrist_panels(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_binocular_webrtc(self, session):
@@ -648,7 +543,6 @@ class TeleVuer:
                 ),
                 to="bgChildren",
             )
-            self._upsert_wrist_panels(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_webrtc(self, session):
@@ -685,7 +579,6 @@ class TeleVuer:
                 ),
                 to="bgChildren",
             )
-            self._upsert_wrist_panels(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     ## ego MODE
@@ -742,7 +635,6 @@ class TeleVuer:
                 to="bgChildren",
             )
             # 'jpeg' encoding should give you about 30fps with a 16ms wait in-between.
-            self._upsert_wrist_panels(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_zmq_ego(self, session):
@@ -783,7 +675,6 @@ class TeleVuer:
                 ],
                 to="bgChildren",
             )
-            self._upsert_wrist_panels(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_binocular_webrtc_ego(self, session):
@@ -821,7 +712,6 @@ class TeleVuer:
                 ),
                 to="bgChildren",
             )
-            self._upsert_wrist_panels(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_webrtc_ego(self, session):
@@ -858,7 +748,6 @@ class TeleVuer:
                 ),
                 to="bgChildren",
             )
-            self._upsert_wrist_panels(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     ## pass-through MODE
