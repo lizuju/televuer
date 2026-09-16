@@ -317,9 +317,9 @@ class TeleVuerWrapper:
         # hand path keeps on the newest frame, so it caches separately.
         self._last_arm_motion_snapshot = dict(self._last_hand_motion_snapshot)
         
-    def render_wrist_to_xr(self, side, image, sequence=None):
+    def render_wrist_to_xr(self, side, image):
         """Publish one wrist camera frame (BGR) to its HUD panel."""
-        self.tvuer.render_wrist_to_xr(side, image, sequence)
+        self.tvuer.render_wrist_to_xr(side, image)
 
     def get_tele_data(self):
         # Arm and hand loops share this wrapper, but not its mutable snapshot cache.
@@ -529,8 +529,8 @@ class TeleVuerWrapper:
                 right_ctrl_thumbstickValue=self.tvuer.right_ctrl_thumbstickValue,
             )
         
-    def render_to_xr(self, img, sequence=None):
-        self.tvuer.render_to_xr(img, sequence)
+    def render_to_xr(self, img):
+        self.tvuer.render_to_xr(img)
     
     def close(self):
         self.tvuer.close()
