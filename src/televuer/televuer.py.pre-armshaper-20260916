@@ -12,11 +12,6 @@ from pathlib import Path
 from typing import Literal
 
 
-#: Upper bounds, in milliseconds, of the hand_move callback inter-arrival bins.
-#: The last bin collects everything above the final edge.
-MOTION_INTERVAL_EDGES_MS = (5, 10, 20, 30, 40, 50, 70, 90, 120, 160, 220, 300, 450, 600, 1000)
-
-
 HAND_TRACKING_STATES = ("missing", "tracking", "invalid")
 
 
@@ -234,16 +229,8 @@ class TeleVuer:
         # Where the motion samples are lost, stage by stage:
         #   0 hand_move events seen, 1 samples begun, 2 committed,
         #   3 motion timestamp written, 4 of those written as 0.0 because one
-        #   hand was missing (min() over a list containing the 0.0 marker),
-        #   5 snapshots the consumer took successfully, 6 snapshots that gave up,
-        #   7 consumer attempts that found a sample mid-flight.
-        self.motion_sample_counts_shared = Array('L', 8, lock=True)
-        # Inter-arrival histogram of hand_move callbacks, in milliseconds. The
-        # counters alone cannot tell a steady 27 Hz stream from the same rate
-        # delivered in bursts, and only the burst case explains why the control
-        # loop sees fresh poses at ~11 Hz while 27 callbacks/s arrive.
-        self.motion_interval_bins_shared = Array('L', len(MOTION_INTERVAL_EDGES_MS), lock=True)
-        self._motion_interval_previous = None
+        #   hand was missing (min() over a list containing the 0.0 marker).
+        self.motion_sample_counts_shared = Array('L', 5, lock=True)
         self.tracking_hand_status_shared = Array('i', 2, lock=True)
         if self.use_hand_tracking:
             self.left_hand_position_shared = Array('d', 75, lock=True)
@@ -396,30 +383,8 @@ class TeleVuer:
         counts = getattr(self, "motion_sample_counts_shared", None)
         if counts is None:
             return
-        if index >= len(counts):
-            return
         with counts.get_lock():
             counts[index] += amount
-
-    def _record_motion_interval(self, now):
-        """Bin the gap since the previous hand_move callback."""
-        bins = getattr(self, "motion_interval_bins_shared", None)
-        if bins is None:
-            return
-        previous = getattr(self, "_motion_interval_previous", None)
-        self._motion_interval_previous = now
-        if previous is None:
-            return
-        elapsed_ms = (now - previous) * 1000.0
-        if not np.isfinite(elapsed_ms) or elapsed_ms < 0.0:
-            return
-        index = len(MOTION_INTERVAL_EDGES_MS) - 1
-        for position, edge in enumerate(MOTION_INTERVAL_EDGES_MS):
-            if elapsed_ms < edge:
-                index = position
-                break
-        with bins.get_lock():
-            bins[index] += 1
 
     def _begin_motion_sample(self):
         self._count_motion(1)
@@ -441,7 +406,6 @@ class TeleVuer:
         with self.tracking_event_counts_shared.get_lock():
             self.tracking_event_counts_shared[1] += 1
         self._count_motion(0)
-        self._record_motion_interval(time.monotonic())
         sample_seq = self._begin_motion_sample()
         now = time.monotonic()
         errors = []
@@ -1175,24 +1139,9 @@ class TeleVuer:
             with counts.get_lock():
                 result.update(dict(zip(
                     ("motion_events", "motion_begun", "motion_committed",
-                     "motion_stamped", "motion_stamp_zero",
-                     "snapshot_ok", "snapshot_none", "snapshot_inflight"),
+                     "motion_stamped", "motion_stamp_zero"),
                     counts[:],
                 )))
-        bins = getattr(self, "motion_interval_bins_shared", None)
-        if bins is not None:
-            with bins.get_lock():
-                values = list(bins[:])
-            # "<=5ms" style labels keep the line readable in the 2 s log. There are
-            # len(edges) bins: everything below the first edge, each edge-to-edge span,
-            # and everything at or above the final edge.
-            edges = ["<=%d" % MOTION_INTERVAL_EDGES_MS[0]]
-            edges += ["%d-%d" % (MOTION_INTERVAL_EDGES_MS[i], MOTION_INTERVAL_EDGES_MS[i + 1])
-                      for i in range(len(MOTION_INTERVAL_EDGES_MS) - 2)]
-            edges.append(">=%d" % MOTION_INTERVAL_EDGES_MS[-1])
-            result["motion_interval_ms"] = {
-                label: count for label, count in zip(edges, values) if count
-            }
         now = time.monotonic()
         for name, shared in (
             ("left_age_ms", self.left_hand_timestamp_shared),
@@ -1217,10 +1166,6 @@ class TeleVuer:
             with self.motion_sample_seq_shared.get_lock():
                 seq_before = self.motion_sample_seq_shared.value
             if seq_before % 2 != 0:
-                # A callback is mid-write. The retry spins with no sleep, so the three
-                # attempts normally observe the same value; if this fires often the
-                # control loop falls back to an older snapshot.
-                self._count_motion(7)
                 continue
 
             snapshot = {
@@ -1251,7 +1196,5 @@ class TeleVuer:
             with self.motion_sample_seq_shared.get_lock():
                 seq_after = self.motion_sample_seq_shared.value
             if seq_before == seq_after and seq_after % 2 == 0:
-                self._count_motion(5)
                 return snapshot
-        self._count_motion(6)
         return None
