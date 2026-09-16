@@ -456,11 +456,15 @@ class TeleVuer:
 
     # ==================== wrist camera panels ====================
     #: Quarter turns applied to each palm frame before it reaches its panel.
-    #: numpy's rot90 counts counter-clockwise and the two cameras sit in the
-    #: hands the same way round, so making both panels read upright takes
-    #: opposite turns: +1 is 90 deg CCW for the left hand, -1 is 90 deg CW for
-    #: the right. Callers size the panel from the rotated shape.
-    WRIST_PANEL_ROTATION = {"left": 1, "right": -1}
+    #: numpy's rot90 counts counter-clockwise, so +1 is a quarter turn CCW and
+    #: -1 a quarter turn CW.
+    #:
+    #: The two cameras sit mirrored in the hands, so the base quarter turns are
+    #: opposite; a further half turn is added on top of both. Written as base
+    #: plus half rather than as the folded result so the intent stays readable
+    #: (rot90 reduces k modulo 4, so +2 is exactly the half turn).
+    #: Callers size the panel from the rotated shape.
+    WRIST_PANEL_ROTATION = {"left": 1 + 2, "right": -1 + 2}
 
     def render_wrist_to_xr(self, side, image):
         """Publish one wrist camera frame (BGR) to the matching HUD panel.
