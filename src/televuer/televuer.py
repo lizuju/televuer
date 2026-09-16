@@ -16,6 +16,30 @@ from typing import Literal
 #: The last bin collects everything above the final edge.
 MOTION_INTERVAL_EDGES_MS = (5, 10, 20, 30, 40, 50, 70, 90, 120, 160, 220, 300, 450, 600, 1000)
 
+#: Upper bounds, in milliseconds, of the Vuer event-loop lag bins. The hand and
+#: camera handlers run on that loop together with the scene updates that push
+#: images to the headset, so if those updates block it, incoming hand samples
+#: cannot be dispatched and arrive in bursts instead.
+EVENT_LOOP_LAG_EDGES_MS = (1, 2, 5, 10, 20, 50, 100, 200, 400, 800, 1600)
+
+
+def bin_labels(edges):
+    """Labels for the histogram bins an edge tuple describes: below the first
+    edge, each edge-to-edge span, and everything at or above the final edge."""
+    labels = ["<=%d" % edges[0]]
+    labels += ["%d-%d" % (edges[i], edges[i + 1]) for i in range(len(edges) - 2)]
+    labels.append(">=%d" % edges[-1])
+    return labels
+
+
+def bin_index(value, edges):
+    index = len(edges) - 1
+    for position, edge in enumerate(edges):
+        if value < edge:
+            index = position
+            break
+    return index
+
 
 HAND_TRACKING_STATES = ("missing", "tracking", "invalid")
 
@@ -244,6 +268,10 @@ class TeleVuer:
         # loop sees fresh poses at ~11 Hz while 27 callbacks/s arrive.
         self.motion_interval_bins_shared = Array('L', len(MOTION_INTERVAL_EDGES_MS), lock=True)
         self._motion_interval_previous = None
+        # How long the Vuer event loop is unavailable, sampled inside the Vuer
+        # process. See EVENT_LOOP_LAG_EDGES_MS.
+        self.event_loop_lag_bins_shared = Array('L', len(EVENT_LOOP_LAG_EDGES_MS), lock=True)
+        self._heartbeat_started = False
         self.tracking_hand_status_shared = Array('i', 2, lock=True)
         if self.use_hand_tracking:
             self.left_hand_position_shared = Array('d', 75, lock=True)
@@ -335,7 +363,35 @@ class TeleVuer:
         self.wrist_panel_frames = {}
         self.wrist_panel_seq = {}
 
+    async def _event_loop_heartbeat(self):
+        """Sample how long this event loop is unavailable, from inside this process.
+
+        A starved loop cannot dispatch hand samples as they arrive, so they queue
+        and are handled in a burst. The motion_interval histogram shows the burst;
+        this shows whether the loop is the reason for it.
+        """
+        interval = 0.005
+        while True:
+            started = time.monotonic()
+            await asyncio.sleep(interval)
+            bins = getattr(self, "event_loop_lag_bins_shared", None)
+            if bins is None:
+                continue
+            lag_ms = (time.monotonic() - started - interval) * 1000.0
+            if not np.isfinite(lag_ms) or lag_ms < 0.0:
+                continue
+            with bins.get_lock():
+                bins[bin_index(lag_ms, EVENT_LOOP_LAG_EDGES_MS)] += 1
+
     async def on_cam_move(self, event, session, fps=60):
+        if not getattr(self, "_heartbeat_started", False):
+            # First camera callback proves the loop is running, which is the only
+            # place a task can be scheduled from.
+            try:
+                asyncio.create_task(self._event_loop_heartbeat())
+                self._heartbeat_started = True
+            except RuntimeError:
+                pass
         with self.tracking_event_counts_shared.get_lock():
             self.tracking_event_counts_shared[0] += 1
         try:
@@ -413,13 +469,8 @@ class TeleVuer:
         elapsed_ms = (now - previous) * 1000.0
         if not np.isfinite(elapsed_ms) or elapsed_ms < 0.0:
             return
-        index = len(MOTION_INTERVAL_EDGES_MS) - 1
-        for position, edge in enumerate(MOTION_INTERVAL_EDGES_MS):
-            if elapsed_ms < edge:
-                index = position
-                break
         with bins.get_lock():
-            bins[index] += 1
+            bins[bin_index(elapsed_ms, MOTION_INTERVAL_EDGES_MS)] += 1
 
     def _begin_motion_sample(self):
         self._count_motion(1)
@@ -1183,15 +1234,17 @@ class TeleVuer:
         if bins is not None:
             with bins.get_lock():
                 values = list(bins[:])
-            # "<=5ms" style labels keep the line readable in the 2 s log. There are
-            # len(edges) bins: everything below the first edge, each edge-to-edge span,
-            # and everything at or above the final edge.
-            edges = ["<=%d" % MOTION_INTERVAL_EDGES_MS[0]]
-            edges += ["%d-%d" % (MOTION_INTERVAL_EDGES_MS[i], MOTION_INTERVAL_EDGES_MS[i + 1])
-                      for i in range(len(MOTION_INTERVAL_EDGES_MS) - 2)]
-            edges.append(">=%d" % MOTION_INTERVAL_EDGES_MS[-1])
             result["motion_interval_ms"] = {
-                label: count for label, count in zip(edges, values) if count
+                label: count
+                for label, count in zip(bin_labels(MOTION_INTERVAL_EDGES_MS), values) if count
+            }
+        lags = getattr(self, "event_loop_lag_bins_shared", None)
+        if lags is not None:
+            with lags.get_lock():
+                values = list(lags[:])
+            result["event_loop_lag_ms"] = {
+                label: count
+                for label, count in zip(bin_labels(EVENT_LOOP_LAG_EDGES_MS), values) if count
             }
         now = time.monotonic()
         for name, shared in (
