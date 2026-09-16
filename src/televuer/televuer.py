@@ -22,6 +22,25 @@ MOTION_INTERVAL_EDGES_MS = (5, 10, 20, 30, 40, 50, 70, 90, 120, 160, 220, 300, 4
 #: cannot be dispatched and arrive in bursts instead.
 EVENT_LOOP_LAG_EDGES_MS = (1, 2, 5, 10, 20, 50, 100, 200, 400, 800, 1600)
 
+#: Slots in the motion-sample queue. Hand samples arrive in bursts -- measured
+#: 2026-09-16, 44% of callbacks land within 5 ms of the previous one -- and a
+#: consumer that reads a latest-value slot keeps only the last frame of each
+#: burst, halving the rate at which the arm reference can advance. Four slots
+#: cover any realistic burst while staying small.
+MOTION_QUEUE_SLOTS = 4
+
+#: A consumer more than this far behind is resynchronised to the newest samples
+#: rather than playing out history.
+MOTION_QUEUE_MAX_BACKLOG = 3
+
+#: Per slot: the three timestamps, then both arm poses, hand positions and hand
+#: orientations, laid out in the order MOTION_QUEUE_FIELDS reads them.
+MOTION_QUEUE_STRIDE = 3 + 2 * 16 + 2 * 75 + 2 * 225
+MOTION_QUEUE_FIELDS = ("left_arm_pose", "right_arm_pose",
+                       "left_hand_positions", "right_hand_positions",
+                       "left_hand_orientations", "right_hand_orientations")
+MOTION_QUEUE_SHAPES = ((4, 4), (4, 4), (25, 3), (25, 3), (25, 3, 3), (25, 3, 3))
+
 
 def bin_labels(edges):
     """Labels for the histogram bins an edge tuple describes: below the first
@@ -289,6 +308,12 @@ class TeleVuer:
             self.right_hand_squeeze_shared = Value('b', False, lock=True)
             self.right_hand_squeezeValue_shared = Value('d', 0.0, lock=True)
             self.hand_pose_guards = (HandPoseGuard(), HandPoseGuard())
+            # Ordered history of hand samples, for consumers that want every frame
+            # of a burst instead of only the newest. See MOTION_QUEUE_SLOTS.
+            self.motion_queue_data_shared = Array('d', MOTION_QUEUE_SLOTS * MOTION_QUEUE_STRIDE, lock=True)
+            self.motion_queue_marks_shared = Array('L', MOTION_QUEUE_SLOTS, lock=True)
+            self.motion_queue_head_shared = Value('L', 0, lock=True)
+            self.motion_queue_tail_shared = Value('L', 0, lock=True)
         else:
             self.left_ctrl_trigger_shared = Value('b', False, lock=True)
             self.left_ctrl_triggerValue_shared = Value('d', 0.0, lock=True)
@@ -557,6 +582,7 @@ class TeleVuer:
             if any(timestamps):
                 with self.motion_data_ready_shared.get_lock():
                     self.motion_data_ready_shared.value = True
+            self._append_motion_sample()
         finally:
             self._commit_motion_sample(sample_seq)
         if errors:
@@ -1264,6 +1290,96 @@ class TeleVuer:
         with self.motion_sample_seq_shared.get_lock():
             result["sample_seq"] = self.motion_sample_seq_shared.value
         return result
+
+    def _append_motion_sample(self):
+        """Push this callback's sample onto the ordered queue.
+
+        Reads back the shared arrays rather than plumbing the values through the
+        loop above, so a slot is byte-identical to what get_hand_motion_snapshot
+        would have returned at this instant -- including a side that is holding
+        its previous pose because its hand is missing.
+        """
+        data = getattr(self, "motion_queue_data_shared", None)
+        if data is None:
+            return
+        # The per-side timestamps have no property; they live in the shared values.
+        with self.left_hand_timestamp_shared.get_lock():
+            left_timestamp = self.left_hand_timestamp_shared.value
+        with self.right_hand_timestamp_shared.get_lock():
+            right_timestamp = self.right_hand_timestamp_shared.value
+        row = [self.motion_data_timestamp, left_timestamp, right_timestamp]
+        for name in MOTION_QUEUE_FIELDS:
+            row.extend(np.asarray(getattr(self, name), dtype=np.float64).ravel())
+        if len(row) != MOTION_QUEUE_STRIDE:
+            return
+        with self.motion_queue_head_shared.get_lock():
+            index = self.motion_queue_head_shared.value
+            self.motion_queue_head_shared.value = index + 1
+        slot = index % MOTION_QUEUE_SLOTS
+        base = slot * MOTION_QUEUE_STRIDE
+        with data.get_lock():
+            data[base:base + MOTION_QUEUE_STRIDE] = row
+        # Written last: a reader that sees this mark knows the slot is complete.
+        with self.motion_queue_marks_shared.get_lock():
+            self.motion_queue_marks_shared[slot] = index
+
+    def pop_hand_motion_sample(self):
+        """Oldest sample this consumer has not taken yet, or None if caught up.
+
+        Each caller advances the single tail, so one consumer must own the queue;
+        a second consumer that keeps up with the newest frame should stay on
+        get_hand_motion_snapshot instead.
+        """
+        data = getattr(self, "motion_queue_data_shared", None)
+        if data is None:
+            return None
+        with self.motion_queue_head_shared.get_lock():
+            head = self.motion_queue_head_shared.value
+        with self.motion_queue_tail_shared.get_lock():
+            tail = self.motion_queue_tail_shared.value
+        # Bound the latency: a consumer that fell behind is resynchronised rather
+        # than fed a history the operator has already moved past.
+        if head - tail > MOTION_QUEUE_MAX_BACKLOG:
+            tail = head - MOTION_QUEUE_MAX_BACKLOG
+            with self.motion_queue_tail_shared.get_lock():
+                self.motion_queue_tail_shared.value = tail
+        if tail >= head:
+            return None
+        slot = tail % MOTION_QUEUE_SLOTS
+        with self.motion_queue_marks_shared.get_lock():
+            if self.motion_queue_marks_shared[slot] != tail:
+                # The ring wrapped over this sample before it was read.
+                with self.motion_queue_tail_shared.get_lock():
+                    self.motion_queue_tail_shared.value = tail + 1
+                return None
+        base = slot * MOTION_QUEUE_STRIDE
+        with data.get_lock():
+            row = list(data[base:base + MOTION_QUEUE_STRIDE])
+        with self.motion_queue_marks_shared.get_lock():
+            if self.motion_queue_marks_shared[slot] != tail:
+                return None
+        with self.motion_queue_tail_shared.get_lock():
+            self.motion_queue_tail_shared.value = tail + 1
+        snapshot = {
+            "motion_data_timestamp": row[0],
+            "left_hand_timestamp": row[1],
+            "right_hand_timestamp": row[2],
+            "motion_data_ready": True,
+            "motion_sample_seq": tail,
+        }
+        cursor = 3
+        for name, shape in zip(MOTION_QUEUE_FIELDS, MOTION_QUEUE_SHAPES):
+            size = int(np.prod(shape))
+            snapshot[name] = np.asarray(row[cursor:cursor + size], dtype=np.float64).reshape(shape)
+            cursor += size
+        # Gestures are low bandwidth and 25 ms of lag on a pinch is not felt, so
+        # they stay on the newest value rather than costing queue space.
+        for name in ("left_hand_pinch", "left_hand_pinchValue",
+                     "left_hand_squeeze", "left_hand_squeezeValue",
+                     "right_hand_pinch", "right_hand_pinchValue",
+                     "right_hand_squeeze", "right_hand_squeezeValue"):
+            snapshot[name] = getattr(self, name)
+        return snapshot
 
     def get_hand_motion_snapshot(self, include_orientations=False, max_attempts=3):
         for _ in range(max_attempts):

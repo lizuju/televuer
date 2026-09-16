@@ -312,6 +312,10 @@ class TeleVuerWrapper:
             "left_hand_timestamp": 0.0,
             "right_hand_timestamp": 0.0,
         }
+        # The arm path consumes the ordered queue so that a burst of hand samples
+        # advances the reference one tick each; it must not rewind the snapshot the
+        # hand path keeps on the newest frame, so it caches separately.
+        self._last_arm_motion_snapshot = dict(self._last_hand_motion_snapshot)
         
     def render_wrist_to_xr(self, side, image):
         """Publish one wrist camera frame (BGR) to its HUD panel."""
@@ -322,7 +326,20 @@ class TeleVuerWrapper:
         with self._tele_data_lock:
             return self._get_tele_data()
 
-    def _get_tele_data(self):
+    def get_arm_tele_data(self):
+        """TeleData for the arm loop, taking one queued hand sample per call.
+
+        The hand stream arrives in bursts (measured 44% of callbacks within 5 ms of
+        the previous one). Reading a latest-value slot keeps only the last frame of
+        each burst, which halves how often the arm reference can advance and makes
+        the target a coarser staircase. Walking the queue instead spends one sample
+        per control tick, so the reference moves in smaller steps at the same
+        average rate. The hand loop keeps using get_tele_data().
+        """
+        with self._tele_data_lock:
+            return self._get_tele_data(consume_motion_queue=True)
+
+    def _get_tele_data(self, consume_motion_queue=False):
         """
         Get processed motion state data from the TeleVuer instance.
 
@@ -345,12 +362,17 @@ class TeleVuerWrapper:
 
         # hand tracking
         if self.use_hand_tracking:
-            motion_snapshot = self.tvuer.get_hand_motion_snapshot(
-                include_orientations=self.return_hand_rot_data
-            )
+            if consume_motion_queue:
+                cache = self._last_arm_motion_snapshot
+                motion_snapshot = self.tvuer.pop_hand_motion_sample()
+            else:
+                cache = self._last_hand_motion_snapshot
+                motion_snapshot = self.tvuer.get_hand_motion_snapshot(
+                    include_orientations=self.return_hand_rot_data
+                )
             if motion_snapshot is not None:
-                self._last_hand_motion_snapshot.update(motion_snapshot)
-            motion_snapshot = self._last_hand_motion_snapshot
+                cache.update(motion_snapshot)
+            motion_snapshot = cache
 
             # 'Arm' pose data follows (basis) OpenXR Convention and (initial pose) OpenXR Arm Convention.
             left_IPxr_Bxr_world_arm, left_arm_is_valid  = safe_mat_update(CONST_LEFT_ARM_POSE, motion_snapshot["left_arm_pose"])
