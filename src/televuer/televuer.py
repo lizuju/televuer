@@ -226,6 +226,11 @@ class TeleVuer:
         self.motion_sample_seq_shared = Value('L', 0, lock=True)
         # Events, accepted hands, errors, missing hands, and suspect hands.
         self.tracking_event_counts_shared = Array('L', 9, lock=True)
+        # Where the motion samples are lost, stage by stage:
+        #   0 hand_move events seen, 1 samples begun, 2 committed,
+        #   3 motion timestamp written, 4 of those written as 0.0 because one
+        #   hand was missing (min() over a list containing the 0.0 marker).
+        self.motion_sample_counts_shared = Array('L', 5, lock=True)
         self.tracking_hand_status_shared = Array('i', 2, lock=True)
         if self.use_hand_tracking:
             self.left_hand_position_shared = Array('d', 75, lock=True)
@@ -369,7 +374,20 @@ class TeleVuer:
         except:
             pass
 
+    def _count_motion(self, index, amount=1):
+        """Bump one stage counter if the diagnostic array exists.
+
+        Tolerant on purpose: some tests build a TeleVuer without running
+        __init__, and a missing counter must never break the control path.
+        """
+        counts = getattr(self, "motion_sample_counts_shared", None)
+        if counts is None:
+            return
+        with counts.get_lock():
+            counts[index] += amount
+
     def _begin_motion_sample(self):
+        self._count_motion(1)
         with self.motion_sample_seq_shared.get_lock():
             current = self.motion_sample_seq_shared.value
             sample_seq = current + 1 if current % 2 == 0 else current + 2
@@ -377,13 +395,17 @@ class TeleVuer:
             return sample_seq
 
     def _commit_motion_sample(self, sample_seq):
+        committed = False
         with self.motion_sample_seq_shared.get_lock():
             if self.motion_sample_seq_shared.value == sample_seq:
                 self.motion_sample_seq_shared.value = sample_seq + 1
+                committed = True
+        self._count_motion(2, int(committed))
 
     async def on_hand_move(self, event, session, fps=60):
         with self.tracking_event_counts_shared.get_lock():
             self.tracking_event_counts_shared[1] += 1
+        self._count_motion(0)
         sample_seq = self._begin_motion_sample()
         now = time.monotonic()
         errors = []
@@ -435,8 +457,11 @@ class TeleVuer:
                     with shared.get_lock():
                         shared.value = value
 
+            oldest = min(timestamps)
             with self.motion_data_timestamp_shared.get_lock():
-                self.motion_data_timestamp_shared.value = min(timestamps)
+                self.motion_data_timestamp_shared.value = oldest
+            self._count_motion(3)
+            self._count_motion(4, int(oldest <= 0.0))
             # Any single side is enough to call the stream ready: each side's own
             # timestamp is zeroed above when that side is missing, so per-side
             # staleness is decided by the consumer, not by this shared flag.
@@ -1109,6 +1134,14 @@ class TeleVuer:
                  "left_missing", "right_missing", "left_suspect", "right_suspect"),
                 self.tracking_event_counts_shared[:],
             ))
+        counts = getattr(self, "motion_sample_counts_shared", None)
+        if counts is not None:
+            with counts.get_lock():
+                result.update(dict(zip(
+                    ("motion_events", "motion_begun", "motion_committed",
+                     "motion_stamped", "motion_stamp_zero"),
+                    counts[:],
+                )))
         now = time.monotonic()
         for name, shared in (
             ("left_age_ms", self.left_hand_timestamp_shared),
