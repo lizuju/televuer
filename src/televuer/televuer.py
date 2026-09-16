@@ -455,6 +455,13 @@ class TeleVuer:
                 self._last_hand_move_error_log = now
 
     # ==================== wrist camera panels ====================
+    #: Quarter turns applied to each palm frame before it reaches its panel.
+    #: numpy's rot90 counts counter-clockwise and the two cameras sit in the
+    #: hands the same way round, so making both panels read upright takes
+    #: opposite turns: +1 is 90 deg CCW for the left hand, -1 is 90 deg CW for
+    #: the right. Callers size the panel from the rotated shape.
+    WRIST_PANEL_ROTATION = {"left": 1, "right": -1}
+
     def render_wrist_to_xr(self, side, image):
         """Publish one wrist camera frame (BGR) to the matching HUD panel.
 
@@ -468,6 +475,9 @@ class TeleVuer:
         image = np.asarray(image)
         if image.ndim != 3 or image.shape[2] != 3:
             return
+        turns = self.WRIST_PANEL_ROTATION.get(side, 0)
+        if turns:
+            image = np.ascontiguousarray(np.rot90(image, turns))
         if image.shape[:2] != frame.shape[:2]:
             image = cv2.resize(image, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
         frame[:] = image
