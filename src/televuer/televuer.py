@@ -873,7 +873,7 @@ class TeleVuer:
                     iceServers=[], 
                     key="video-quad",
                     aspect=self.aspect_ratio,
-                    height = 11,
+                    height = 8,
                     layout="stereo-left-right"
                 ),
                 to="bgChildren",
