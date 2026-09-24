@@ -236,7 +236,9 @@ class TeleVuerWrapper:
                        wrist_panels: tuple=(), wrist_panel_height: float=0.26, wrist_panel_distance: float=1.2,
                        wrist_panel_offset: tuple=(0.40, 0.40), wrist_panel_aspect: float=4.0 / 3.0,
                        wrist_panel_shape: tuple=(240, 320),
-                       arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw"):
+                       torque_hud: bool=False,
+                       arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw",
+                       motion_source=None):
         """
         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
         It initializes the TeleVuer instance with the specified parameters and provides a method to get motion state data.
@@ -284,12 +286,16 @@ class TeleVuerWrapper:
         self.use_hand_tracking = use_hand_tracking
         self.return_hand_rot_data = return_hand_rot_data
         self.arm_reference_mode = arm_reference_mode
-        self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
-                              display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
-                              cert_file=cert_file, key_file=key_file,
-                              wrist_panels=wrist_panels, wrist_panel_height=wrist_panel_height,
-                              wrist_panel_distance=wrist_panel_distance, wrist_panel_offset=wrist_panel_offset,
-                              wrist_panel_aspect=wrist_panel_aspect, wrist_panel_shape=wrist_panel_shape)
+        if motion_source is None:
+            self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
+                                  display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url,
+                                  cert_file=cert_file, key_file=key_file,
+                                  wrist_panels=wrist_panels, wrist_panel_height=wrist_panel_height,
+                                  wrist_panel_distance=wrist_panel_distance, wrist_panel_offset=wrist_panel_offset,
+                                  wrist_panel_aspect=wrist_panel_aspect, wrist_panel_shape=wrist_panel_shape,
+                                  torque_hud=torque_hud)
+        else:
+            self.tvuer = motion_source
         self._tele_data_lock = threading.Lock()
         self._last_hand_motion_snapshot = {
             "left_arm_pose": CONST_LEFT_ARM_POSE.copy(),
@@ -320,6 +326,10 @@ class TeleVuerWrapper:
     def render_wrist_to_xr(self, side, image, sequence=None):
         """Publish one wrist camera frame (BGR) to its HUD panel."""
         self.tvuer.render_wrist_to_xr(side, image, sequence)
+
+    def render_torque_hud_to_xr(self, side, image):
+        """Publish one O6 torque number strip onto the Vision Pro scene overlay."""
+        self.tvuer.render_torque_hud_to_xr(side, image)
 
     def get_tele_data(self):
         # Arm and hand loops share this wrapper, but not its mutable snapshot cache.
@@ -373,6 +383,8 @@ class TeleVuerWrapper:
             if motion_snapshot is not None:
                 cache.update(motion_snapshot)
             motion_snapshot = cache
+            if "head_pose" in motion_snapshot:
+                Bxr_world_head = motion_snapshot["head_pose"]
 
             # 'Arm' pose data follows (basis) OpenXR Convention and (initial pose) OpenXR Arm Convention.
             left_IPxr_Bxr_world_arm, left_arm_is_valid  = safe_mat_update(CONST_LEFT_ARM_POSE, motion_snapshot["left_arm_pose"])

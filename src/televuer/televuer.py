@@ -63,6 +63,13 @@ def bin_index(value, edges):
 HAND_TRACKING_STATES = ("missing", "tracking", "invalid")
 
 
+def webxr_session_mode_for_display(display_mode: str) -> str:
+    """Request AR for passthrough; the client verifies device support and blending."""
+    if display_mode in ("ego", "pass-through"):
+        return "immersive-ar"
+    return "immersive-vr"
+
+
 class HandPoseGuard:
     def __init__(self):
         self.pose = None
@@ -112,7 +119,8 @@ class TeleVuer:
                        cert_file: str=None, key_file: str=None,
                        wrist_panels: tuple=(), wrist_panel_height: float=0.26, wrist_panel_distance: float=1.2,
                        wrist_panel_offset: tuple=(0.40, 0.40), wrist_panel_aspect: float=4.0 / 3.0,
-                       wrist_panel_shape: tuple=(240, 320)):
+                       wrist_panel_shape: tuple=(240, 320),
+                       torque_hud: bool=False):
         """
         TeleVuer class for OpenXR-based XR teleoperate applications.
         This class handles the communication with the Vuer server and manages image and pose data.
@@ -137,6 +145,10 @@ class TeleVuer:
         :param wrist_panel_aspect: float, panel width/height (4:3 for the 640x480 wrist cameras).
         :param wrist_panel_shape: tuple, (height, width) the wrist frames are scaled to before they
             are JPEG-encoded into the scene stream; small keeps the tracking channel light.
+        :param torque_hud: bool, overlay Linker O6 joint-torque number strips on the
+            scene channel (the same ImageBackground path as the wrist panels). Needed
+            because the headset watches WebRTC 60001; painting the ZMQ JPEG never
+            reaches the display.
         :param cert_file: str, path to the SSL certificate file.
         :param key_file: str, path to the SSL key file.
 
@@ -208,7 +220,16 @@ class TeleVuer:
                     cert_file = cert_file or str(current_module_dir / "cert.pem")
                     key_file = key_file or str(current_module_dir / "key.pem")
 
-        self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+        # Vision Pro: ego/pass-through need immersive-ar or the surround is opaque black.
+        self.webxr_session_mode = webxr_session_mode_for_display(display_mode)
+        self.vuer = Vuer(
+            host='0.0.0.0',
+            cert=cert_file,
+            key=key_file,
+            queries=dict(grid=False, xrMode=self.webxr_session_mode),
+            queue_len=3,
+        )
+        self._install_webxr_mode_index()
         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
         if self.use_hand_tracking:
             self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
@@ -238,6 +259,29 @@ class TeleVuer:
             self.wrist_panel_shm[side] = panel_shm
             self.wrist_panel_frames[side] = np.ndarray(self.wrist_panel_shape, dtype=np.uint8, buffer=panel_shm.buf)
             self.wrist_panel_seq[side] = Value('L', 0, lock=True)
+
+        # Torque number strips ride the same scene channel as the wrist panels so
+        # they show up on top of WebRTC, not only on the unused ZMQ JPEG path.
+        self.torque_hud_enabled = bool(torque_hud)
+        # Digits are centred in this strip. The old 512x40 plane was 1.28 m
+        # wide, so the glyphs sat on its left edge, outside the video window.
+        self.torque_hud_shape = (48, 280, 3)
+        self.torque_hud_aspect = self.torque_hud_shape[1] / self.torque_hud_shape[0]
+        self.torque_hud_height = 0.09
+        self.torque_hud_distance = 1.0
+        # (right_x, y). Same inset on each side, just above the middle.
+        self.torque_hud_offset = (0.36, 0.06)
+        self.torque_hud_left_x = 0.36
+        self.torque_hud_shm = {}
+        self.torque_hud_frames = {}
+        self.torque_hud_seq = {}
+        self.torque_hud_sent = None
+        if self.torque_hud_enabled:
+            for side in ("left", "right"):
+                panel_shm = shared_memory.SharedMemory(create=True, size=int(np.prod(self.torque_hud_shape)))
+                self.torque_hud_shm[side] = panel_shm
+                self.torque_hud_frames[side] = np.ndarray(self.torque_hud_shape, dtype=np.uint8, buffer=panel_shm.buf)
+                self.torque_hud_seq[side] = Value('L', 0, lock=True)
 
         if self.display_mode == "immersive":
             if self.webrtc:
@@ -405,6 +449,15 @@ class TeleVuer:
         self.wrist_panel_shm = {}
         self.wrist_panel_frames = {}
         self.wrist_panel_seq = {}
+        for panel_shm in getattr(self, "torque_hud_shm", {}).values():
+            try:
+                panel_shm.close()
+                panel_shm.unlink()
+            except:
+                pass
+        self.torque_hud_shm = {}
+        self.torque_hud_frames = {}
+        self.torque_hud_seq = {}
 
     async def _event_loop_heartbeat(self):
         """Sample how long this event loop is unavailable, from inside this process.
@@ -425,6 +478,31 @@ class TeleVuer:
                 continue
             with bins.get_lock():
                 bins[bin_index(lag_ms, EVENT_LOOP_LAG_EDGES_MS)] += 1
+
+    def _install_webxr_mode_index(self):
+        """Serve one consistent client build with the selected XR session mode."""
+        from aiohttp.hdrs import UPGRADE
+        from aiohttp.web import HTTPFound, Response
+        from vuer.server import Vuer as _Vuer
+
+        vuer = self.vuer
+        mode = self.webxr_session_mode
+
+        async def socket_index(request):
+            if "websocket" == request.headers.get(UPGRADE, "").lower().strip():
+                return await _Vuer.socket_index(vuer, request)
+            if request.rel_url.query.get("xrMode") != mode:
+                items = [(k, v) for k, v in request.rel_url.query.items() if k != "xrMode"]
+                items.append(("xrMode", mode))
+                raise HTTPFound(str(request.rel_url.with_query(items)))
+            index_path = Path(vuer.client_root) / "assets/xr-session-fix/index.html"
+            html = index_path.read_text(encoding="utf-8")
+            snippet = f'<script>window.__TELEVUER_XR_MODE__="{mode}";</script>'
+            html = html.replace("</head>", snippet + "\n</head>", 1)
+            return Response(text=html, content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+
+        vuer.socket_index = socket_index
 
     async def on_cam_move(self, event, session, fps=60):
         if not getattr(self, "_heartbeat_started", False):
@@ -789,6 +867,65 @@ class TeleVuer:
         session.upsert(elements, to="bgChildren")
         return True
 
+    def render_torque_hud_to_xr(self, side, image):
+        """Publish one torque number strip (BGR) onto the scene overlay."""
+        frame = self.torque_hud_frames.get(side)
+        if frame is None or image is None:
+            return
+        image = np.asarray(image)
+        if image.ndim != 3 or image.shape[2] != 3:
+            return
+        if image.shape[:2] != frame.shape[:2]:
+            image = cv2.resize(image, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
+        frame[:] = image
+        sequence = self.torque_hud_seq[side]
+        with sequence.get_lock():
+            sequence.value += 1
+
+    def _torque_hud_elements(self):
+        elements = []
+        for side, sign in (("left", -1.0), ("right", 1.0)):
+            frame = self.torque_hud_frames.get(side)
+            sequence = self.torque_hud_seq.get(side)
+            if frame is None or sequence is None:
+                continue
+            with sequence.get_lock():
+                ready = sequence.value > 0
+            if not ready:
+                continue
+            elements.append(
+                ImageBackground(
+                    frame,
+                    aspect=self.torque_hud_aspect,
+                    height=self.torque_hud_height,
+                    distanceToCamera=self.torque_hud_distance,
+                    position=[
+                        -self.torque_hud_left_x if side == "left" else self.torque_hud_offset[0],
+                        self.torque_hud_offset[1],
+                        0.0,
+                    ],
+                    format="jpeg",
+                    quality=70,
+                    key=f"torque-hud-{side}",
+                )
+            )
+        return elements
+
+    def _upsert_torque_hud(self, session, force=False):
+        elements = self._torque_hud_elements()
+        if not elements:
+            return False
+        current = {}
+        for side, sequence in self.torque_hud_seq.items():
+            with sequence.get_lock():
+                current[side] = sequence.value
+        # Resend every display frame. The stereo video plane is upserted on
+        # that same loop, and a skipped strip disappears from the headset.
+        # These images are 280x48, not the wrist panels.
+        self.torque_hud_sent = current
+        session.upsert(elements, to="bgChildren")
+        return True
+
     ## immersive MODE
     async def main_image_binocular_zmq(self, session):
         if self.use_hand_tracking:
@@ -814,6 +951,7 @@ class TeleVuer:
         while True:
             self._upsert_head_planes(session)
             self._upsert_wrist_panels(session)
+            self._upsert_torque_hud(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_zmq(self, session):
@@ -841,6 +979,7 @@ class TeleVuer:
         while True:
             self._upsert_head_planes(session)
             self._upsert_wrist_panels(session)
+            self._upsert_torque_hud(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_binocular_webrtc(self, session):
@@ -879,6 +1018,7 @@ class TeleVuer:
                 to="bgChildren",
             )
             self._upsert_wrist_panels(session)
+            self._upsert_torque_hud(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_webrtc(self, session):
@@ -916,6 +1056,7 @@ class TeleVuer:
                 to="bgChildren",
             )
             self._upsert_wrist_panels(session)
+            self._upsert_torque_hud(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     ## ego MODE
@@ -943,6 +1084,7 @@ class TeleVuer:
         while True:
             self._upsert_head_planes(session)
             self._upsert_wrist_panels(session)
+            self._upsert_torque_hud(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_zmq_ego(self, session):
@@ -970,6 +1112,7 @@ class TeleVuer:
         while True:
             self._upsert_head_planes(session)
             self._upsert_wrist_panels(session)
+            self._upsert_torque_hud(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_binocular_webrtc_ego(self, session):
@@ -1008,6 +1151,7 @@ class TeleVuer:
                 to="bgChildren",
             )
             self._upsert_wrist_panels(session)
+            self._upsert_torque_hud(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_monocular_webrtc_ego(self, session):
@@ -1045,6 +1189,7 @@ class TeleVuer:
                 to="bgChildren",
             )
             self._upsert_wrist_panels(session)
+            self._upsert_torque_hud(session)
             await asyncio.sleep(1.0 / self.display_fps)
 
     ## pass-through MODE
